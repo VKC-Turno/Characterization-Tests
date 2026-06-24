@@ -1,0 +1,7 @@
+# Dashboard-only deps. Pair this with post_processing_script/requirements.txt
+# if you also want to (re)generate the parquet outputs from the dashboard host.
+streamlit>=1.30
+plotly>=5.18
+pandas>=2.0
+pyarrow>=14.0
+numpy>=1.24

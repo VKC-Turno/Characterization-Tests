@@ -25,6 +25,9 @@ _SUCCESS
 .idea/
 .DS_Store
 
+# Generated dashboard snapshots (regenerable via dashboard/export_snapshot.py)
+dashboard/snapshots/
+
 # Jupyter
 .ipynb_checkpoints/
 

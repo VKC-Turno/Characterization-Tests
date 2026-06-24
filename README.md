@@ -1,36 +1,37 @@
-# post_processing_script — PySpark post-processing for battery characterisation tests
+# Characterization Tests RD — battery characterization post-processing + dashboard
 
-Local-first PySpark package that re-implements the existing post-processing
-logic (HPPC pulse identification, OCV/SOC curves, DCIR R0 anchors, per-cycle
-aggregates) on top of Spark so the same code can run unchanged as an AWS
-Glue job later.
+End-to-end characterization workflow:
 
-**No AWS calls happen in this package.** The package reads from local CSVs
-and writes to local Parquet. The `scripts/glue_main.py` file is an
-entry-point stub for the eventual Glue deployment — it is never imported
-by the local runner.
+1. **Pull** raw cycler data from Athena into local CSVs (`scripts/_pull_*.py`)
+2. **Process** the CSVs into partitioned Parquet via PySpark (`post_processing/`,
+   driven by `scripts/run_local.py`)
+3. **Visualize** the Parquet outputs in a Streamlit dashboard (`dashboard/`)
+
+The PySpark stage runs identically locally and as an AWS Glue job. No AWS calls
+are made by the local runner — `scripts/glue_main.py` is an entry-point stub for
+the eventual Glue deployment.
 
 ## Layout
 
 ```
-post_processing_script/
-├── post_processing/
-│   ├── spark_session.py        # local + Glue-compatible session builder
-│   ├── config.py               # input + output schemas (typed, explicit)
+Characterization_Tests_RD/
+├── post_processing/                # PySpark transform package
+│   ├── spark_session.py            # local + Glue-compatible session builder
+│   ├── config.py                   # input + output schemas (typed, explicit)
 │   ├── io/
-│   │   ├── readers.py          # name-aware CSV reader (handles missing cols)
-│   │   └── writers.py          # partitioned Parquet writer
-│   ├── transforms/             # one applyInPandas-style UDF per test
-│   │   ├── hppc.py             # VKC pulse identification — R0/R1/R2/C1/C2
-│   │   ├── ocv.py              # OCV(SoC) charge + discharge, 11 SoC anchors
-│   │   ├── dcir.py             # DCIR R0 anchor(s)
-│   │   ├── gitt.py             # long-pulse R + V_inf + τ_diff per anchor
-│   │   ├── rate_cap.py         # Q vs C-rate, charge + discharge
-│   │   ├── self_discharge.py   # ΔV/Δt drift, capacity retention
-│   │   ├── peak_power.py       # P_max envelope per SoC, per direction
-│   │   ├── constant_power.py   # energy + time-to-cutoff per P set-point
-│   │   └── cycle_agg.py        # per-(cell, cycle) capacity / V / CE (Longterm + RPT)
-│   └── jobs/                   # one orchestration entry-point per test
+│   │   ├── readers.py              # name-aware CSV reader (handles missing cols)
+│   │   └── writers.py              # partitioned Parquet writer
+│   ├── transforms/                 # one applyInPandas-style UDF per test
+│   │   ├── hppc.py                 # VKC pulse identification — R0/R1/R2/C1/C2
+│   │   ├── ocv.py                  # OCV(SoC) charge + discharge, 11 SoC anchors
+│   │   ├── dcir.py                 # DCIR R0 anchor(s)
+│   │   ├── gitt.py                 # long-pulse R + V_inf + τ_diff per anchor
+│   │   ├── rate_cap.py             # Q vs C-rate, charge + discharge
+│   │   ├── self_discharge.py       # ΔV/Δt drift, capacity retention
+│   │   ├── peak_power.py           # P_max envelope per SoC, per direction
+│   │   ├── constant_power.py       # energy + time-to-cutoff per P set-point
+│   │   └── cycle_agg.py            # per-(cell, cycle) capacity / V / CE
+│   └── jobs/                       # one orchestration entry-point per test
 │       ├── hppc_job.py
 │       ├── ocv_job.py
 │       ├── dcir_job.py
@@ -39,13 +40,41 @@ post_processing_script/
 │       ├── self_discharge_job.py
 │       ├── peak_power_job.py
 │       ├── constant_power_job.py
-│       └── cycle_job.py        # shared by cycles_long + cycles_rpt
+│       └── cycle_job.py            # shared by cycles_long + cycles_rpt
+│
 ├── scripts/
-│   ├── run_local.py            # local CLI runner (zips package + ships to workers)
-│   └── glue_main.py            # AWS Glue entry-point stub
-├── tests/                      # (placeholder for pytest fixtures)
-├── requirements.txt
+│   ├── _pull_hppc.py               # generic Athena puller: --make X --batch Y --cell Z
+│   ├── _pull_rept_hppc.py          # REPT batch-1 helper (preserves legacy entry-point)
+│   ├── run_local.py                # local CLI runner for the PySpark pipeline
+│   └── glue_main.py                # AWS Glue entry-point stub
+│
+├── dashboard/                      # Streamlit dashboard for the Parquet outputs
+│   ├── app.py                      # page router + global Make/Batch/Cell sidebar
+│   ├── data_loader.py              # pyarrow.dataset reader with partition prune
+│   ├── views/                      # one view per test (HPPC / OCV / DCIR / ...)
+│   ├── export_snapshot.py          # render dashboard to self-contained HTML
+│   ├── snapshots/                  # generated HTML snapshots
+│   ├── README.md
+│   └── requirements.txt            # streamlit + plotly + pyarrow (no PySpark)
+│
+├── requirements.txt                # PySpark stage deps
 └── README.md
+```
+
+## Full pipeline — Athena → Parquet → dashboard
+
+```bash
+# 1. Pull raw data from Athena (drops CSVs into Data/HPPC/ etc.)
+python scripts/_pull_hppc.py --make REPT --batch 1 --cell 0001
+
+# 2. Process all 10 tests into partitioned Parquet
+python scripts/run_local.py --job all
+
+# 3. Launch the dashboard
+python -m streamlit run dashboard/app.py
+
+# 4. (optional) Export a static HTML snapshot
+python dashboard/export_snapshot.py
 ```
 
 ## Test coverage

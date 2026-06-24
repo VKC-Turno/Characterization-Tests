@@ -1,20 +1,31 @@
 """AWS Glue 4.0 entrypoint.
 
-Deploy as the Glue Job script (Python shell or Spark). Glue invokes this
-file with --JOB_NAME and the args defined in the job. We expose:
+Deploy as the Glue Job script (Type = Spark). Glue invokes this file with
+--JOB_NAME and the args defined in the job. We expose:
 
-    --job          one of (hppc | ocv | dcir | cycles_long | cycles_rpt)
+    --job          one of the 10 test pipelines:
+                       hppc | ocv | dcir | gitt | rate_cap |
+                       self_discharge | peak_power | constant_power |
+                       cycles_long | cycles_rpt
     --input        S3 path glob to read   (e.g. s3://lake/raw/HPPC/*.parquet)
     --output       S3 path to write to    (e.g. s3://lake/processed/HPPC/)
     --input-fmt    csv | parquet (default parquet on Glue)
 
 The package itself must be uploaded as a Glue --extra-py-files zip:
-    cd post_processing_script
+    cd Characterization_Tests_RD
     zip -r post_processing.zip post_processing
-    aws s3 cp post_processing.zip s3://<lake>/glue/libs/
+    aws s3 cp post_processing.zip       s3://<lake>/glue/libs/
+    aws s3 cp scripts/glue_main.py      s3://<lake>/glue/jobs/
 
 …and referenced in the Glue job config:
     --extra-py-files s3://<lake>/glue/libs/post_processing.zip
+
+Example job-parameter set for an HPPC run:
+    --extra-py-files  s3://<lake>/glue/libs/post_processing.zip
+    --job             hppc
+    --input           s3://<lake>/raw/HPPC/*.parquet
+    --output          s3://<lake>/processed/HPPC/
+    --input-fmt       parquet
 """
 from __future__ import annotations
 
