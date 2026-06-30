@@ -1,14 +1,8 @@
-"""Peak-power extraction — P_max envelope per SoC, per direction.
+"""Peak-power extraction (lab-reference port).
 
-Protocol: at multiple SoC anchors, the cell sees short pulses of increasing
-current magnitude until a voltage cutoff is hit. Peak power = max(|V·I|)
-across the pulse, with the instantaneous V and I recorded.
-
-We treat each (cycle, direction) pair as one SoC anchor and emit:
-  - p_peak_w, v_at_peak, i_at_peak, duration_s
-
-SoC ordinal is taken from the cycle order — the protocol typically does
-9 cycles spanning 0.1 → 0.9 SoC.
+Short (≤30 s) high-current pulses at SoC anchors, both directions. Report the
+sustained power |V·I| at 10 s into each pulse, labelled by the SoC at the
+pulse start (from the SoC tracker, rounded to 2 dp).
 """
 from __future__ import annotations
 
@@ -18,84 +12,59 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from ..config import PEAK_POWER_SCHEMA
+from ._steps import build_steps, soc_at_step_starts
+
+PROBE_TIME_S = 10.0
+MAX_PULSE_DURATION_S = 30.0
 
 
-def _derive_step_no(df: pd.DataFrame) -> pd.Series:
-    if "cycler_step_no" in df.columns and df["cycler_step_no"].notna().any():
-        return df["cycler_step_no"].astype("Int64")
-    names = pd.Series(df["step_name"].astype(str).values)
-    return (names != names.shift()).cumsum()
+def _probe(d: pd.DataFrame, dt_target: float):
+    """(power_w, v, i) at dt_target s into the pulse, or (nan,nan,nan) if short."""
+    if d.empty:
+        return float("nan"), float("nan"), float("nan")
+    t = (d["absolute_time"] - d["absolute_time"].iloc[0]).dt.total_seconds().to_numpy()
+    if t[-1] < dt_target:
+        return float("nan"), float("nan"), float("nan")
+    v = float(np.interp(dt_target, t, d["volt_v"].to_numpy()))
+    i = float(np.interp(dt_target, t, d["current_a"].to_numpy()))
+    return abs(v * i), v, i
 
 
 def _extract_one_cell(pdf: pd.DataFrame) -> pd.DataFrame:
-    make    = str(pdf["make"].iloc[0])
-    batch   = str(pdf["batch"].iloc[0])
+    make = str(pdf["make"].iloc[0]); batch = str(pdf["batch"].iloc[0])
     cell_no = str(pdf["cell_no"].iloc[0])
+    max_cap = float(pdf["max_cap"].iloc[0]) if pdf["max_cap"].notna().any() else float("nan")
+    nom = max_cap
+    empty = pd.DataFrame(columns=[f.name for f in PEAK_POWER_SCHEMA.fields])
+    if not np.isfinite(nom) or nom <= 0:
+        return empty
 
-    pdf = pdf.sort_values("absolute_time").reset_index(drop=True).copy()
-    pdf["_step_no"] = _derive_step_no(pdf)
-    pdf["_power"]   = (pdf["volt_v"] * pdf["current_a"].abs()).astype(float)
+    step, pdf = build_steps(pdf)
+    soc_all = soc_at_step_starts(step, nom)
+    short = step["duration_s"] <= MAX_PULSE_DURATION_S
+    big = step["current_mean_a"].abs() > 1.0
+    sn = step["step_name"].astype(str)
 
-    rows = []
-    # Build per-step summary first to find which steps are pulses
-    agg = pdf.groupby("_step_no").agg(
-        step_name=("step_name", "first"),
-        cycle_no= ("cycle_no", "first"),
-        i_mean=   ("current_a", lambda s: float(s.abs().mean())),
-        t_start=  ("absolute_time", "first"),
-        t_end=    ("absolute_time", "last"),
-    ).reset_index()
-    agg["duration_s"] = (pd.to_datetime(agg["t_end"]) -
-                          pd.to_datetime(agg["t_start"])).dt.total_seconds()
-
-    # Anchor SoC by ordinal cycle index. Discover unique cycles in order
-    cycles_seen = list(dict.fromkeys(agg["cycle_no"].dropna().astype(int).tolist()))
-    soc_of_cycle = {c: (i + 1) / (len(cycles_seen) + 1) for i, c in enumerate(cycles_seen)} \
-        if cycles_seen else {}
-
-    for _, s in agg.iterrows():
-        sn = str(s["step_name"])
-        if s["i_mean"] < 1.0 or s["duration_s"] < 1.0 or s["duration_s"] > 120.0:
-            continue
-        if "DChg" in sn:
-            direction = "dchg"
-        elif "Chg" in sn:
-            direction = "chg"
-        else:
-            continue
-
-        rows_in_step = pdf[pdf["_step_no"] == s["_step_no"]]
-        if rows_in_step.empty:
-            continue
-        peak_idx = rows_in_step["_power"].idxmax()
-        peak = rows_in_step.loc[peak_idx]
-        rows.append({
-            "make":      make,
-            "batch":     batch,
-            "cell_no":   cell_no,
-            "direction": direction,
-            "soc":       float(soc_of_cycle.get(int(s["cycle_no"]),
-                                                  (cycles_seen.index(int(s["cycle_no"])) + 1) /
-                                                  (len(cycles_seen) + 1)
-                                                  if cycles_seen and int(s["cycle_no"]) in cycles_seen
-                                                  else 0.5)),
-            "p_peak_w":  float(peak["_power"]),
-            "v_at_peak": float(peak["volt_v"]),
-            "i_at_peak": float(abs(peak["current_a"])),
-            "duration_s": float(s["duration_s"]),
-        })
-
+    rows = {}   # (direction, soc) -> row (last wins, like the reference dict)
+    for direction, frag in (("dchg", "DChg"), ("chg", "CC_Chg")):
+        sel = step[short & big & sn.str.contains(frag, case=False, na=False)]
+        for idx, p in sel.iterrows():
+            d = pdf[pdf["_block"] == p["_block"]].sort_values("absolute_time")
+            pw, v, i = _probe(d, PROBE_TIME_S)
+            soc_v = soc_all.get(idx, float("nan"))
+            soc = round(float(soc_v), 2) if pd.notna(soc_v) else float("nan")
+            rows[(direction, soc)] = {
+                "make": make, "batch": batch, "cell_no": cell_no, "max_cap": max_cap,
+                "direction": direction, "soc": float(soc), "p_peak_w": float(pw),
+                "v_at_peak": float(v), "i_at_peak": float(i),
+                "duration_s": float(p["duration_s"])}
     if not rows:
-        return pd.DataFrame(columns=[f.name for f in PEAK_POWER_SCHEMA.fields])
-    out = pd.DataFrame(rows)
-    # Multiple pulses at the same (direction, soc) → keep the highest P_peak
-    out = (out.sort_values("p_peak_w", ascending=False)
-              .drop_duplicates(["direction", "soc"]))
-    return out[[f.name for f in PEAK_POWER_SCHEMA.fields]]
+        return empty
+    return pd.DataFrame(list(rows.values()))[[f.name for f in PEAK_POWER_SCHEMA.fields]]
 
 
 def extract_peak_power(raw_df: DataFrame) -> DataFrame:
     return (raw_df
             .where(F.col("test") == F.lit("PeakPower"))
-            .groupBy("make", "batch", "cell_no")
+            .groupBy("make", "batch", "cell_no", "max_cap")
             .applyInPandas(_extract_one_cell, schema=PEAK_POWER_SCHEMA))

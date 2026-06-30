@@ -25,6 +25,17 @@ _SUCCESS
 .idea/
 .DS_Store
 
+# Harness / local config
+.claude/
+
+# Validation artifacts + reference data (not code)
+comparison_*.csv
+comparison_*.xlsx
+*_result.csv
+Char_Consolidated_VKC_SoC.xlsx
+.~*.xlsx
+~$*.xlsx
+
 # Generated dashboard snapshots (regenerable via dashboard/export_snapshot.py)
 dashboard/snapshots/
 

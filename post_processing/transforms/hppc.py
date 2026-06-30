@@ -74,6 +74,7 @@ def _detect_pulses_one_cell(pdf: pd.DataFrame) -> pd.DataFrame:
     make    = str(pdf["make"].iloc[0])
     batch   = str(pdf["batch"].iloc[0])
     cell_no = str(pdf["cell_no"].iloc[0])
+    max_cap = float(pdf["max_cap"].iloc[0]) if pdf["max_cap"].notna().any() else float("nan")
 
     pdf = pdf.sort_values("absolute_time").reset_index(drop=True).copy()
     pdf["_step_no"] = _derive_step_no(pdf)
@@ -86,6 +87,7 @@ def _detect_pulses_one_cell(pdf: pd.DataFrame) -> pd.DataFrame:
         v_first=  ("volt_v", "first"),
         v_last=   ("volt_v", "last"),
         i_mean=   ("current_a", lambda s: float(s.abs().mean())),
+        i_signed= ("current_a", "mean"),
         cycle_no= ("cycle_no", "first"),
     ).reset_index()
     agg["duration_s"] = (pd.to_datetime(agg["t_end"]) -
@@ -116,11 +118,13 @@ def _detect_pulses_one_cell(pdf: pd.DataFrame) -> pd.DataFrame:
         tau1 = max(t_fast - t_post, 1e-6)
         tau2 = max(t_end  - t_fast, 1e-6)
 
-        I_step = float(cur["i_mean"])
-        R0  = (prev["v_last"] - cur["v_first"]) / I_step * 1000.0
-        R1  = (cur["v_first"] - V_fast) / I_step * 1000.0
-        R2  = (V_fast - cur["v_last"])  / I_step * 1000.0
-        R30 = (prev["v_last"] - cur["v_last"]) / I_step * 1000.0
+        # I_step is the SIGNED mean current (negative for discharge) — this is
+        # what hppc_i_at_pulse_dchg reports. Resistances use the magnitude.
+        I_step = float(cur["i_signed"])
+        R0  = abs((prev["v_last"] - cur["v_first"]) / I_step) * 1000.0
+        R1  = abs((cur["v_first"] - V_fast) / I_step) * 1000.0
+        R2  = abs((V_fast - cur["v_last"])  / I_step) * 1000.0
+        R30 = abs((prev["v_last"] - cur["v_last"]) / I_step) * 1000.0
         C1  = tau1 / (R1 * 1e-3) if R1 != 0 else float("nan")
         C2  = tau2 / (R2 * 1e-3) if R2 != 0 else float("nan")
 
@@ -128,6 +132,7 @@ def _detect_pulses_one_cell(pdf: pd.DataFrame) -> pd.DataFrame:
             "make":       make,
             "batch":      batch,
             "cell_no":    cell_no,
+            "max_cap":    max_cap,
             "cycle_no":   int(cur["cycle_no"]) if pd.notna(cur["cycle_no"]) else None,
             "pulse_idx":  pulse_idx,
             "step_no":    sn,
@@ -166,5 +171,5 @@ def detect_hppc_pulses(raw_df: DataFrame) -> DataFrame:
     """
     return (raw_df
             .where(F.col("test") == F.lit("HPPC"))
-            .groupBy("make", "batch", "cell_no")
+            .groupBy("make", "batch", "cell_no", "max_cap")
             .applyInPandas(_detect_pulses_one_cell, schema=PULSE_SCHEMA))

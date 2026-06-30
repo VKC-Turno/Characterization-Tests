@@ -38,7 +38,7 @@ def aggregate_per_cycle(raw_df: DataFrame) -> DataFrame:
     # and SoH = dchg_cap / Q_rpt collapses to zero across the board.
     step_lvl = (df
                 .where(F.col("_phase") != "other")
-                .groupBy("make", "batch", "cell_no", "cycle_no", "_phase", "_step_id")
+                .groupBy("make", "batch", "cell_no", "max_cap", "cycle_no", "_phase", "_step_id")
                 .agg(F.max(F.abs(F.col("capacity_ah"))).alias("step_cap_ah"),
                      F.avg("volt_v").alias("step_avg_v"),
                      F.max("volt_v").alias("step_v_max"),
@@ -49,16 +49,16 @@ def aggregate_per_cycle(raw_df: DataFrame) -> DataFrame:
     chg  = step_lvl.where(F.col("_phase") == "chg")
     dchg = step_lvl.where(F.col("_phase") == "dchg")
 
-    chg_agg = (chg.groupBy("make", "batch", "cell_no", "cycle_no")
+    chg_agg = (chg.groupBy("make", "batch", "cell_no", "max_cap", "cycle_no")
                   .agg(F.sum("step_cap_ah").alias("chg_cap_ah"),
                        F.avg("step_avg_v").alias("avg_chg_v"),
                        F.max("step_v_max").alias("chg_v_max")))
-    dchg_agg = (dchg.groupBy("make", "batch", "cell_no", "cycle_no")
+    dchg_agg = (dchg.groupBy("make", "batch", "cell_no", "max_cap", "cycle_no")
                     .agg(F.sum("step_cap_ah").alias("dchg_cap_ah"),
                          F.avg("step_avg_v").alias("avg_dchg_v"),
                          F.min("step_v_min").alias("dchg_v_min")))
 
-    joined = (chg_agg.join(dchg_agg, ["make", "batch", "cell_no", "cycle_no"], "fullouter")
+    joined = (chg_agg.join(dchg_agg, ["make", "batch", "cell_no", "max_cap", "cycle_no"], "fullouter")
                      .withColumn("coulombic_eff",
                                  F.when(F.col("chg_cap_ah") > 0,
                                         F.col("dchg_cap_ah") / F.col("chg_cap_ah"))))

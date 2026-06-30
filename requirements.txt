@@ -2,3 +2,5 @@ pyspark==3.5.1
 pyarrow>=14.0.0
 pandas>=2.0.0
 numpy>=1.24.0
+scipy>=1.10.0
+boto3>=1.26.0

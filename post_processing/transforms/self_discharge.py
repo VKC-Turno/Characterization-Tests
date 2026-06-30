@@ -17,6 +17,9 @@ from pyspark.sql import functions as F
 
 from ..config import SELF_DISCHARGE_SCHEMA
 
+LFP_PLATEAU_DV_PER_SOC = 0.05   # V per unit SoC — rough LFP plateau slope
+DEFAULT_AMBIENT_C      = 25.0   # no temperature column in the raw export
+
 
 def _derive_step_no(df: pd.DataFrame) -> pd.Series:
     if "cycler_step_no" in df.columns and df["cycler_step_no"].notna().any():
@@ -29,6 +32,7 @@ def _extract_one_cell(pdf: pd.DataFrame) -> pd.DataFrame:
     make    = str(pdf["make"].iloc[0])
     batch   = str(pdf["batch"].iloc[0])
     cell_no = str(pdf["cell_no"].iloc[0])
+    max_cap = float(pdf["max_cap"].iloc[0]) if pdf["max_cap"].notna().any() else float("nan")
 
     pdf = pdf.sort_values("absolute_time").reset_index(drop=True).copy()
     pdf["_step_no"] = _derive_step_no(pdf)
@@ -72,21 +76,28 @@ def _extract_one_cell(pdf: pd.DataFrame) -> pd.DataFrame:
 
     retention = (q_after / q_before * 100.0) if (q_before and q_before > 0 and pd.notna(q_after)) else float("nan")
 
+    # dsoc_per_day is a CROSS-TEST column (needs the OCV curve to invert V→SoC),
+    # so it's computed once in post_processing.post_join after the wide row is
+    # assembled — NOT here. We only emit the inputs (v_start/v_end/rest).
+    # Ambient is a constant 25 °C (no temperature column in the raw export).
     return pd.DataFrame([{
         "make":           make,
         "batch":          batch,
         "cell_no":        cell_no,
+        "max_cap":        max_cap,
         "rest_duration_s": dur_s,
         "v_start":        v_start,
         "v_end":          v_end,
         "dv_dt_mV_per_h": float(dv_dt),
         "q_recovered_ah": q_after,
         "retention_pct":  retention,
+        "dsoc_per_day":   float("nan"),
+        "ambient_c":      DEFAULT_AMBIENT_C,
     }])[[f.name for f in SELF_DISCHARGE_SCHEMA.fields]]
 
 
 def extract_self_discharge(raw_df: DataFrame) -> DataFrame:
     return (raw_df
             .where(F.col("test") == F.lit("SelfDischarge"))
-            .groupBy("make", "batch", "cell_no")
+            .groupBy("make", "batch", "cell_no", "max_cap")
             .applyInPandas(_extract_one_cell, schema=SELF_DISCHARGE_SCHEMA))

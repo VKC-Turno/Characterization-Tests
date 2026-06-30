@@ -1,8 +1,10 @@
-"""Rate-capability extraction — Q vs C-rate, both directions.
+"""Rate-capability extraction — Q vs C-rate (lab-reference port).
 
-Protocol: at each C-rate the cell undergoes a (CCCV charge → rest →
-CC discharge → rest) cycle. We aggregate per (cycle, direction) step
-and infer C-rate from the mean current divided by the nominal capacity.
+Per direction, keep only steps whose capacity is a real full(ish) cycle
+(``step_capacity_ah >= 0.5 * nominal``) and that aren't constant-power steps,
+bucket by C-rate = round(|I_mean| / nominal, 2), and take the MEDIAN capacity
+per bucket. The 0.5·nominal floor + CP exclusion drop the SoC-setup partial
+discharges that otherwise create spurious low-C buckets.
 """
 from __future__ import annotations
 
@@ -12,73 +14,50 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from ..config import RATE_CAP_SCHEMA
+from ._steps import build_steps
 
-
-def _derive_step_no(df: pd.DataFrame) -> pd.Series:
-    if "cycler_step_no" in df.columns and df["cycler_step_no"].notna().any():
-        return df["cycler_step_no"].astype("Int64")
-    names = pd.Series(df["step_name"].astype(str).values)
-    return (names != names.shift()).cumsum()
+MIN_USEFUL_CAPACITY_FRAC = 0.50
+RATE_ROUNDING = 2
 
 
 def _extract_one_cell(pdf: pd.DataFrame) -> pd.DataFrame:
-    make    = str(pdf["make"].iloc[0])
-    batch   = str(pdf["batch"].iloc[0])
+    make = str(pdf["make"].iloc[0]); batch = str(pdf["batch"].iloc[0])
     cell_no = str(pdf["cell_no"].iloc[0])
-    nominal = float(pdf["max_cap"].dropna().iloc[0]) if pdf["max_cap"].notna().any() else float("nan")
+    max_cap = float(pdf["max_cap"].iloc[0]) if pdf["max_cap"].notna().any() else float("nan")
+    nom = max_cap
+    empty = pd.DataFrame(columns=[f.name for f in RATE_CAP_SCHEMA.fields])
+    if not np.isfinite(nom) or nom <= 0:
+        return empty
 
-    pdf = pdf.sort_values("absolute_time").reset_index(drop=True).copy()
-    pdf["_step_no"] = _derive_step_no(pdf)
-
-    # Per-step aggregate — capacity column is monotone-within-step
-    # capacity_ah is signed (+ on chg, − on dchg). Take absolute peak so the
-    # discharge half-cycle isn't dropped by the q_step_ah > 0 filter below.
-    step_lvl = (pdf
-                .groupby(["_step_no", "cycle_no", "step_name"])
-                .agg(q_step_ah=("capacity_ah", lambda s: float(s.abs().max())),
-                     i_mean=("current_a", lambda s: float(s.abs().mean())),
-                     v_avg=("volt_v", "mean"),
-                     t_start=("absolute_time", "first"),
-                     t_end=("absolute_time", "last"))
-                .reset_index())
-    step_lvl["duration_s"] = (pd.to_datetime(step_lvl["t_end"]) -
-                                pd.to_datetime(step_lvl["t_start"])).dt.total_seconds()
+    step, _ = build_steps(pdf)
+    sn = step["step_name"].astype(str)
+    not_cp = ~sn.str.contains("CP", case=False, na=False)
+    floor = step["step_capacity_ah"] >= MIN_USEFUL_CAPACITY_FRAC * nom
 
     rows = []
-    for _, s in step_lvl.iterrows():
-        sn = str(s["step_name"])
-        if "Chg" in sn and "DChg" not in sn:
-            direction = "chg"
-        elif "DChg" in sn:
-            direction = "dchg"
-        else:
+    masks = {
+        "dchg": sn.str.contains("DChg", case=False, na=False) & not_cp & floor,
+        "chg":  sn.str.contains("Chg",  case=False, na=False) & not_cp & floor,
+    }
+    for direction, mask in masks.items():
+        sel = step[mask].copy()
+        if sel.empty:
             continue
-        if s["i_mean"] < 0.5 or s["q_step_ah"] <= 0:
-            continue
-        c_rate = float(s["i_mean"] / nominal) if nominal and nominal > 0 else float("nan")
-        # Energy ≈ V_avg × Q
-        energy = float(s["v_avg"] * s["q_step_ah"]) if pd.notna(s["v_avg"]) else float("nan")
-        rows.append({
-            "make":      make,
-            "batch":     batch,
-            "cell_no":   cell_no,
-            "direction": direction,
-            "c_rate":    float(round(c_rate, 2)) if not np.isnan(c_rate) else float("nan"),
-            "q_ah":      float(s["q_step_ah"]),
-            "energy_wh": energy,
-        })
-
+        sel["c_rate"] = (sel["current_mean_a"].abs() / nom).round(RATE_ROUNDING)
+        by = (sel.groupby("c_rate", as_index=False)["step_capacity_ah"]
+                 .median().sort_values("c_rate"))
+        for _, r in by.iterrows():
+            rows.append({"make": make, "batch": batch, "cell_no": cell_no,
+                         "max_cap": max_cap, "direction": direction,
+                         "c_rate": float(r["c_rate"]), "q_ah": float(r["step_capacity_ah"]),
+                         "energy_wh": float("nan")})
     if not rows:
-        return pd.DataFrame(columns=[f.name for f in RATE_CAP_SCHEMA.fields])
-    out = pd.DataFrame(rows)
-    # Multiple steps may land on the same (direction, c_rate) — keep the max Q
-    out = (out.groupby(["make","batch","cell_no","direction","c_rate"], as_index=False)
-              .agg({"q_ah": "max", "energy_wh": "max"}))
-    return out[[f.name for f in RATE_CAP_SCHEMA.fields]]
+        return empty
+    return pd.DataFrame(rows)[[f.name for f in RATE_CAP_SCHEMA.fields]]
 
 
 def extract_rate_capability(raw_df: DataFrame) -> DataFrame:
     return (raw_df
             .where(F.col("test") == F.lit("RateCapability"))
-            .groupBy("make", "batch", "cell_no")
+            .groupBy("make", "batch", "cell_no", "max_cap")
             .applyInPandas(_extract_one_cell, schema=RATE_CAP_SCHEMA))

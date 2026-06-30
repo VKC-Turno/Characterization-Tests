@@ -1,11 +1,12 @@
-# Characterization Tests RD — battery characterization post-processing + dashboard
+# Characterization Tests RD — battery characterization post-processing
 
-End-to-end characterization workflow:
+End-to-end characterization workflow (pure PySpark):
 
 1. **Pull** raw cycler data from Athena into local CSVs (`scripts/_pull_*.py`)
 2. **Process** the CSVs into partitioned Parquet via PySpark (`post_processing/`,
-   driven by `scripts/run_local.py`)
-3. **Visualize** the Parquet outputs in a Streamlit dashboard (`dashboard/`)
+   driven by `scripts/run_local.py`) and merge into one consolidated cell CSV
+3. **(or)** run the whole thing for one cell per make straight off S3 with
+   `scripts/run_one_cell_per_make.py` — no intermediate files kept
 
 The PySpark stage runs identically locally and as an AWS Glue job. No AWS calls
 are made by the local runner — `scripts/glue_main.py` is an entry-point stub for
@@ -31,55 +32,55 @@ Characterization_Tests_RD/
 │   │   ├── peak_power.py           # P_max envelope per SoC, per direction
 │   │   ├── constant_power.py       # energy + time-to-cutoff per P set-point
 │   │   └── cycle_agg.py            # per-(cell, cycle) capacity / V / CE
-│   └── jobs/                       # one orchestration entry-point per test
-│       ├── hppc_job.py
-│       ├── ocv_job.py
-│       ├── dcir_job.py
-│       ├── gitt_job.py
-│       ├── rate_cap_job.py
-│       ├── self_discharge_job.py
-│       ├── peak_power_job.py
-│       ├── constant_power_job.py
-│       └── cycle_job.py            # shared by cycles_long + cycles_rpt
+│   ├── jobs/                       # one orchestration entry-point per test
+│   │   ├── hppc_job.py
+│   │   ├── ocv_job.py
+│   │   ├── dcir_job.py
+│   │   ├── gitt_job.py
+│   │   ├── rate_cap_job.py
+│   │   ├── self_discharge_job.py
+│   │   ├── peak_power_job.py
+│   │   ├── constant_power_job.py
+│   │   └── cycle_job.py            # shared by cycles_long + cycles_rpt
+│   └── consolidate.py              # PySpark merge of per-test outputs → one CSV
 │
 ├── scripts/
 │   ├── _pull_hppc.py               # generic Athena puller: --make X --batch Y --cell Z
 │   ├── _pull_rept_hppc.py          # REPT batch-1 helper (preserves legacy entry-point)
 │   ├── run_local.py                # local CLI runner for the PySpark pipeline
+│   ├── consolidate.py              # standalone consolidation runner
+│   ├── run_one_cell_per_make.py    # 1 cell/make, all tests, from S3 → one CSV
 │   └── glue_main.py                # AWS Glue entry-point stub
-│
-├── dashboard/                      # Streamlit dashboard for the Parquet outputs
-│   ├── app.py                      # page router + global Make/Batch/Cell sidebar
-│   ├── data_loader.py              # pyarrow.dataset reader with partition prune
-│   ├── views/                      # one view per test (HPPC / OCV / DCIR / ...)
-│   ├── export_snapshot.py          # render dashboard to self-contained HTML
-│   ├── snapshots/                  # generated HTML snapshots
-│   ├── README.md
-│   └── requirements.txt            # streamlit + plotly + pyarrow (no PySpark)
 │
 ├── requirements.txt                # PySpark stage deps
 └── README.md
 ```
 
-## Full pipeline — Athena → Parquet → dashboard
+## Full pipeline — Athena → Parquet → consolidated CSV
 
 ```bash
 # 1. Pull raw data from Athena (drops CSVs into Data/HPPC/ etc.)
 python scripts/_pull_hppc.py --make REPT --batch 1 --cell 0001
 
 # 2. Process all 10 tests into partitioned Parquet
+#    (also writes output/consolidated_cells.csv — one merged row per cell)
 python scripts/run_local.py --job all
 
-# 3. Launch the dashboard
-python -m streamlit run dashboard/app.py
+# 2b. (or) just (re)build the merged one-row-per-cell CSV from existing parquet
+python scripts/run_local.py --job consolidate
+# equivalently: python scripts/consolidate.py
+```
 
-# 4. (optional) Export a static HTML snapshot
-python dashboard/export_snapshot.py
+### One cell per make, straight from S3 (no intermediate files)
+
+```bash
+# Picks one cell per make, runs every test, writes ONLY the final CSV.
+python scripts/run_one_cell_per_make.py --result one_cell_per_make_result.csv
 ```
 
 ## Test coverage
 
-All 10 raw test folders under `Data/` have a transform + job + dashboard view:
+All 10 raw test folders under `Data/` have a transform + job:
 
 | Test            | Raw folder     | Job key          | Output table     | Row shape                          |
 |-----------------|----------------|------------------|------------------|------------------------------------|
@@ -98,7 +99,24 @@ All 10 raw test folders under `Data/` have a transform + job + dashboard view:
 
 ```
 post_processing_script/output/<TEST>/make=<X>/batch=<Y>/part-*.snappy.parquet
+post_processing_script/output/consolidated_cells.csv   ← merged, one row per cell
 ```
+
+### Consolidated cell file
+
+After `--job all` (or `--job consolidate`), every per-test parquet table is
+merged into a single **one-row-per-cell** CSV at
+`output/consolidated_cells.csv`. Each test's curve becomes a stringified-list
+column (e.g. `r0_dchg_curve`, `ocv_soc_grid`, `rate_cap_q_curve`), keyed on the
+cell primary key `(make, batch, cell_no, max_cap)`. The consolidation is pure
+PySpark ([`post_processing/consolidate.py`](post_processing/consolidate.py)).
+
+Columns left blank because they aren't derivable from the per-test outputs
+(they live in the raw time-series or aren't computed by any transform):
+`test_session_start`, `test_session_end`, `rpt_protocol_c_rate`,
+`self_disch_dsoc_per_day`, `self_disch_ambient_c`, `ocv_details_path`,
+`dcir_soc_nominal`, `dcir_i_at_pulse`. The `chemistry` column is stamped from
+`--chemistry` (default `LFP`) since the local outputs don't carry it.
 
 Querying with DuckDB / Athena partition-prunes automatically:
 

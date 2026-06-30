@@ -27,6 +27,7 @@ def _derive_step_no(df: pd.DataFrame) -> pd.Series:
 
 def _extract_one_cell(pdf: pd.DataFrame) -> pd.DataFrame:
     make, batch, cell_no = pdf["make"].iloc[0], pdf["batch"].iloc[0], pdf["cell_no"].iloc[0]
+    max_cap = float(pdf["max_cap"].iloc[0]) if pdf["max_cap"].notna().any() else float("nan")
     pdf = pdf.sort_values("absolute_time").reset_index(drop=True).copy()
     pdf["_step_no"] = _derive_step_no(pdf)
 
@@ -65,7 +66,8 @@ def _extract_one_cell(pdf: pd.DataFrame) -> pd.DataFrame:
         for s_target in SOC_GRID:
             v_at_s = float(np.interp(s_target, soc_s, v_s))
             out.append({"make": str(make), "batch": str(batch), "cell_no": str(cell_no),
-                        "direction": direction, "soc": float(s_target), "v_oc": v_at_s})
+                        "max_cap": max_cap, "direction": direction,
+                        "soc": float(s_target), "v_oc": v_at_s})
 
     if not out:
         return pd.DataFrame(columns=[f.name for f in OCV_CURVE_SCHEMA.fields])
@@ -76,5 +78,5 @@ def extract_ocv_curves(raw_df: DataFrame) -> DataFrame:
     """Spark transform: raw OCV/SOC time-series → (cell × direction × SoC, V_OC)."""
     return (raw_df
             .where(F.upper(F.col("test")).isin("OCVSOC", "OCV_SOC", "OCV"))
-            .groupBy("make", "batch", "cell_no")
+            .groupBy("make", "batch", "cell_no", "max_cap")
             .applyInPandas(_extract_one_cell, schema=OCV_CURVE_SCHEMA))

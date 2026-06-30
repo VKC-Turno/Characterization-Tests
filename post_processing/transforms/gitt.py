@@ -1,17 +1,10 @@
-"""GITT pulse extraction.
+"""GITT extraction (lab-reference port).
 
-GITT protocol = a long CC pulse (typically 10–30 min at 0.1 C) followed by
-a long rest (~60 min) to let the cell relax to equilibrium. Each pulse
-sits at a known SoC, so the protocol sweeps SoC by stepping through pulses.
-
-Per pulse we extract:
-  - R_pulse  = (V_pre - V_during_pulse) / I_step           (mΩ)
-  - V_inf    = OCV reached at the end of the relaxation     (V)
-  - tau_diff = exponential time-constant of the relaxation  (s)
-
-SoC is labelled ordinally — pulse N is the N-th equilibrium point. We do
-NOT impose a 10 % grid (unlike VKC HPPC) because GITT cells typically run
-20 or 40 anchors with non-uniform spacing.
+Walk (pulse, rest) step pairs. A usable pulse is a CC_DChg of 60–1800 s with
+|I| ≥ 1 A followed by a rest ≥ 600 s. Per pulse:
+    r_pulse  = |V_end − V_start| / |I| · 1000           (mΩ)
+    SoC      = soc_at_step_starts (descends from 1.0)
+    V_inf,τ  = single-exponential fit of the rest relaxation V(t)=V∞+A·e^(−t/τ)
 """
 from __future__ import annotations
 
@@ -21,113 +14,96 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
 from ..config import GITT_PULSE_SCHEMA
+from ._steps import build_steps, soc_at_step_starts
+
+MIN_PULSE_DURATION_S = 60.0
+MAX_PULSE_DURATION_S = 1800.0
+MIN_PULSE_CURRENT_A  = 1.0
+MIN_REST_DURATION_S  = 600.0
+MIN_REST_SAMPLES     = 30
 
 
-MIN_PULSE_DURATION_S = 60.0       # long pulse, not HPPC's 10s
-MAX_PULSE_DURATION_S = 3600.0
-MIN_REST_DURATION_S  = 600.0      # ≥10 min rest for relaxation
-MIN_PULSE_CURRENT_A  = 0.5
+def _fit_relaxation(rest_d: pd.DataFrame, direction: int):
+    if len(rest_d) < MIN_REST_SAMPLES:
+        return float("nan"), float("nan")
+    try:
+        from scipy.optimize import curve_fit
+    except Exception:
+        return float("nan"), float("nan")
+    t0 = rest_d["absolute_time"].iloc[0]
+    t = (rest_d["absolute_time"] - t0).dt.total_seconds().to_numpy(dtype=float)
+    v = rest_d["volt_v"].to_numpy(dtype=float)
+    v0, v_last = float(v[0]), float(v[-1])
+    V_inf_guess = v_last
+    A_guess = v0 - V_inf_guess
+    tau_guess = max(60.0, (t[-1] - t[0]) / 5.0)
+    if direction < 0:
+        A_lo, A_hi = -0.5, -1e-5
+        Vinf_lo, Vinf_hi = v0, v0 + 1.0
+    else:
+        A_lo, A_hi = 1e-5, 0.5
+        Vinf_lo, Vinf_hi = v0 - 1.0, v0
+    tau_lo, tau_hi = 5.0, 1e5
+    V_inf_guess = float(np.clip(V_inf_guess, Vinf_lo + 1e-6, Vinf_hi - 1e-6))
+    A_guess = float(np.clip(A_guess, A_lo + 1e-7, A_hi - 1e-7))
 
+    def model(tt, V_inf, A, tau):
+        return V_inf + A * np.exp(-tt / tau)
 
-def _exp_relax_tau(t: np.ndarray, v: np.ndarray) -> float:
-    """Crude tau estimate: time to reach 63% of (v_end - v_start).
-
-    Falls back to NaN if relaxation is flat or non-monotonic.
-    """
-    if len(v) < 5 or t[-1] - t[0] <= 0:
-        return float("nan")
-    v_target = v[0] + 0.632 * (v[-1] - v[0])
-    if (v[-1] - v[0]) == 0:
-        return float("nan")
-    idx = np.argmin(np.abs(v - v_target))
-    return float(t[idx] - t[0])
-
-
-def _derive_step_no(df: pd.DataFrame) -> pd.Series:
-    if "cycler_step_no" in df.columns and df["cycler_step_no"].notna().any():
-        return df["cycler_step_no"].astype("Int64")
-    names = pd.Series(df["step_name"].astype(str).values)
-    return (names != names.shift()).cumsum()
+    try:
+        popt, _ = curve_fit(model, t, v, p0=(V_inf_guess, A_guess, tau_guess),
+                            bounds=([Vinf_lo, A_lo, tau_lo], [Vinf_hi, A_hi, tau_hi]),
+                            maxfev=10_000)
+        return float(popt[0]), float(popt[2])
+    except Exception:
+        return float("nan"), float("nan")
 
 
 def _extract_one_cell(pdf: pd.DataFrame) -> pd.DataFrame:
-    make    = str(pdf["make"].iloc[0])
-    batch   = str(pdf["batch"].iloc[0])
+    make = str(pdf["make"].iloc[0]); batch = str(pdf["batch"].iloc[0])
     cell_no = str(pdf["cell_no"].iloc[0])
+    max_cap = float(pdf["max_cap"].iloc[0]) if pdf["max_cap"].notna().any() else float("nan")
+    nom = max_cap
+    empty = pd.DataFrame(columns=[f.name for f in GITT_PULSE_SCHEMA.fields])
+    if not np.isfinite(nom) or nom <= 0:
+        return empty
 
-    pdf = pdf.sort_values("absolute_time").reset_index(drop=True).copy()
-    pdf["_step_no"] = _derive_step_no(pdf)
-
-    agg = pdf.groupby("_step_no").agg(
-        step_name=("step_name", "first"),
-        t_start=  ("absolute_time", "first"),
-        t_end=    ("absolute_time", "last"),
-        v_first=  ("volt_v", "first"),
-        v_last=   ("volt_v", "last"),
-        i_mean=   ("current_a", lambda s: float(s.abs().mean())),
-    ).reset_index()
-    agg["duration_s"] = (pd.to_datetime(agg["t_end"]) -
-                          pd.to_datetime(agg["t_start"])).dt.total_seconds()
+    step, pdf = build_steps(pdf)
+    ordered = step.sort_values("start_time").reset_index(drop=True)
+    orig_index = step.sort_values("start_time").index
+    soc_at_start = soc_at_step_starts(step, nom)
 
     rows = []
     pulse_idx = 0
-    n_pulses_total = sum(1 for i in range(1, len(agg))
-                          if agg.iloc[i]["step_name"] in ("CC_DChg", "CC_Chg")
-                             and MIN_PULSE_DURATION_S <= agg.iloc[i]["duration_s"] <= MAX_PULSE_DURATION_S
-                             and "Rest" in str(agg.iloc[i-1]["step_name"])
-                             and agg.iloc[i-1]["duration_s"] >= MIN_REST_DURATION_S
-                             and agg.iloc[i]["i_mean"] >= MIN_PULSE_CURRENT_A)
-    if n_pulses_total == 0:
-        return pd.DataFrame(columns=[f.name for f in GITT_PULSE_SCHEMA.fields])
-
-    for i in range(2, len(agg)):
-        cur, prev = agg.iloc[i-1], agg.iloc[i-2]
-        rest_after = agg.iloc[i] if i < len(agg) else None
-        if not (cur["step_name"] in ("CC_DChg", "CC_Chg")
-                and "Rest" in str(prev["step_name"])
-                and prev["duration_s"] >= MIN_REST_DURATION_S
-                and MIN_PULSE_DURATION_S <= cur["duration_s"] <= MAX_PULSE_DURATION_S
-                and cur["i_mean"] >= MIN_PULSE_CURRENT_A
-                and rest_after is not None
-                and "Rest" in str(rest_after["step_name"])):
+    for i in range(len(ordered) - 1):
+        pulse = ordered.iloc[i]; nxt = ordered.iloc[i + 1]
+        if "CC_DChg" not in str(pulse["step_name"]):
             continue
+        dur = float(pulse["duration_s"])
+        if dur < MIN_PULSE_DURATION_S or dur > MAX_PULSE_DURATION_S:
+            continue
+        i_mean = float(pulse["current_mean_a"])
+        if abs(i_mean) < MIN_PULSE_CURRENT_A:
+            continue
+        if "rest" not in str(nxt["step_name"]).lower() or float(nxt["duration_s"]) < MIN_REST_DURATION_S:
+            continue
+
+        r_mohm = abs(float(pulse["end_volt_v"]) - float(pulse["start_volt_v"])) / abs(i_mean) * 1000.0
+        rest_d = pdf[pdf["_block"] == nxt["_block"]].sort_values("absolute_time").reset_index(drop=True)
+        V_inf, tau = _fit_relaxation(rest_d, -1 if i_mean < 0 else 1)
+        soc_v = soc_at_start.get(orig_index[i], float("nan"))
         pulse_idx += 1
-
-        I_step = float(cur["i_mean"])
-        # R is a magnitude; sign of (V_pre − V_first) flips between charge and
-        # discharge pulses (V rises during charge, falls during discharge).
-        r_pulse = abs(prev["v_last"] - cur["v_first"]) / I_step * 1000.0   # mΩ
-
-        # Relaxation curve = the Rest immediately after this pulse
-        sn_rest = int(rest_after["_step_no"])
-        relax = pdf[pdf["_step_no"] == sn_rest].reset_index(drop=True)
-        v_relax = relax["volt_v"].to_numpy(dtype=float)
-        t_relax = (pd.to_datetime(relax["absolute_time"]).values
-                    .astype("datetime64[ms]").astype(float)) / 1000.0
-        if len(v_relax) >= 2:
-            v_inf = float(v_relax[-1])
-            tau   = _exp_relax_tau(t_relax - t_relax[0], v_relax)
-        else:
-            v_inf = float(cur["v_last"]); tau = float("nan")
-
-        rows.append({
-            "make":          make,
-            "batch":         batch,
-            "cell_no":       cell_no,
-            "pulse_idx":     pulse_idx,
-            "soc":           pulse_idx / n_pulses_total,
-            "r_pulse_mohm":  float(r_pulse),
-            "tau_diff_s":    float(tau),
-            "v_inf_v":       v_inf,
-        })
-
+        rows.append({"make": make, "batch": batch, "cell_no": cell_no, "max_cap": max_cap,
+                     "pulse_idx": pulse_idx,
+                     "soc": round(float(soc_v), 3) if pd.notna(soc_v) else float("nan"),
+                     "r_pulse_mohm": float(r_mohm), "tau_diff_s": float(tau), "v_inf_v": float(V_inf)})
     if not rows:
-        return pd.DataFrame(columns=[f.name for f in GITT_PULSE_SCHEMA.fields])
+        return empty
     return pd.DataFrame(rows)[[f.name for f in GITT_PULSE_SCHEMA.fields]]
 
 
 def extract_gitt_pulses(raw_df: DataFrame) -> DataFrame:
     return (raw_df
             .where(F.col("test") == F.lit("GITT"))
-            .groupBy("make", "batch", "cell_no")
+            .groupBy("make", "batch", "cell_no", "max_cap")
             .applyInPandas(_extract_one_cell, schema=GITT_PULSE_SCHEMA))

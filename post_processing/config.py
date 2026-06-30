@@ -42,6 +42,7 @@ PULSE_SCHEMA = StructType([
     StructField("make",       StringType(),  False),
     StructField("batch",      StringType(),  False),
     StructField("cell_no",    StringType(),  False),
+    StructField("max_cap",    DoubleType(),  False),
     StructField("cycle_no",   IntegerType(), True),
     StructField("pulse_idx",  IntegerType(), False),
     StructField("step_no",    IntegerType(), True),
@@ -68,6 +69,7 @@ CYCLE_AGG_SCHEMA = StructType([
     StructField("make",         StringType(),  False),
     StructField("batch",        StringType(),  False),
     StructField("cell_no",      StringType(),  False),
+    StructField("max_cap",      DoubleType(),  False),
     StructField("cycle_no",     IntegerType(), False),
     StructField("chg_cap_ah",   DoubleType(),  True),
     StructField("dchg_cap_ah",  DoubleType(),  True),
@@ -85,6 +87,7 @@ OCV_CURVE_SCHEMA = StructType([
     StructField("make",     StringType(),  False),
     StructField("batch",    StringType(),  False),
     StructField("cell_no",  StringType(),  False),
+    StructField("max_cap",  DoubleType(),  False),
     StructField("direction", StringType(), False),     # "chg" | "dchg"
     StructField("soc",      DoubleType(),  False),
     StructField("v_oc",     DoubleType(),  True),
@@ -95,8 +98,11 @@ DCIR_ANCHOR_SCHEMA = StructType([
     StructField("make",     StringType(),  False),
     StructField("batch",    StringType(),  False),
     StructField("cell_no",  StringType(),  False),
+    StructField("max_cap",  DoubleType(),  False),
+    StructField("pulse_idx", IntegerType(), False),   # detection order (1..n)
     StructField("soc",      DoubleType(),  False),
     StructField("r0_mohm",  DoubleType(),  True),
+    StructField("i_at_pulse", DoubleType(), True),    # per-pulse mean current (A)
 ])
 
 # GITT — one row per pulse anchor
@@ -104,6 +110,7 @@ GITT_PULSE_SCHEMA = StructType([
     StructField("make",       StringType(),  False),
     StructField("batch",      StringType(),  False),
     StructField("cell_no",    StringType(),  False),
+    StructField("max_cap",    DoubleType(),  False),
     StructField("pulse_idx",  IntegerType(), False),
     StructField("soc",        DoubleType(),  True),
     StructField("r_pulse_mohm", DoubleType(), True),
@@ -116,6 +123,7 @@ RATE_CAP_SCHEMA = StructType([
     StructField("make",      StringType(),  False),
     StructField("batch",     StringType(),  False),
     StructField("cell_no",   StringType(),  False),
+    StructField("max_cap",   DoubleType(),  False),
     StructField("direction", StringType(),  False),    # "chg" | "dchg"
     StructField("c_rate",    DoubleType(),  False),
     StructField("q_ah",      DoubleType(),  True),
@@ -127,12 +135,15 @@ SELF_DISCHARGE_SCHEMA = StructType([
     StructField("make",           StringType(),  False),
     StructField("batch",          StringType(),  False),
     StructField("cell_no",        StringType(),  False),
+    StructField("max_cap",        DoubleType(),  False),
     StructField("rest_duration_s", DoubleType(), True),
     StructField("v_start",        DoubleType(),  True),
     StructField("v_end",          DoubleType(),  True),
     StructField("dv_dt_mV_per_h", DoubleType(),  True),
     StructField("q_recovered_ah", DoubleType(),  True),  # CC_DChg after rest
     StructField("retention_pct",  DoubleType(),  True),  # q_recovered / q_before_rest
+    StructField("dsoc_per_day",   DoubleType(),  True),  # -ΔV / 0.05 / days (LFP plateau)
+    StructField("ambient_c",      DoubleType(),  True),  # ambient °C during rest (default 25)
 ])
 
 # Peak power — one row per direction per SoC anchor; P_max from V·I envelope
@@ -140,6 +151,7 @@ PEAK_POWER_SCHEMA = StructType([
     StructField("make",      StringType(),  False),
     StructField("batch",     StringType(),  False),
     StructField("cell_no",   StringType(),  False),
+    StructField("max_cap",   DoubleType(),  False),
     StructField("direction", StringType(),  False),    # "chg" | "dchg"
     StructField("soc",       DoubleType(),  False),
     StructField("p_peak_w",  DoubleType(),  True),
@@ -153,6 +165,7 @@ CONSTANT_POWER_SCHEMA = StructType([
     StructField("make",       StringType(),  False),
     StructField("batch",      StringType(),  False),
     StructField("cell_no",    StringType(),  False),
+    StructField("max_cap",    DoubleType(),  False),
     StructField("direction",  StringType(),  False),   # "chg" | "dchg"
     StructField("power_w",    DoubleType(),  False),
     StructField("energy_wh",  DoubleType(),  True),
